@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from datasets.dataset_loader import ARADDataset
+from dataset.dataset_loader import ARADDataset
 from models.Residual_predictor import ResidualPredictor
 
 # --------------------------------------------------
