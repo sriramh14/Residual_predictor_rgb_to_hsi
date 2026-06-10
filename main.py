@@ -137,11 +137,16 @@ optimizer = torch.optim.Adam(
 
 best_loss = float("inf")
 
+
 for epoch in range(NUM_EPOCHS):
 
     residual_net.train()
 
     running_loss = 0.0
+    running_mrae = 0.0
+    running_sam = 0.0
+    running_psnr = 0.0
+    running_ssim = 0.0
 
     for rgb, hsi in train_loader:
 
@@ -178,6 +183,25 @@ for epoch in range(NUM_EPOCHS):
             loss_latent
             + loss_recon
         )
+        running_mrae += mrae_loss(
+            hsi_pred,
+            hsi
+        ).item()
+
+        running_sam += sam_loss(
+            hsi_pred,
+            hsi
+        ).item()
+        
+        running_psnr += psnr_loss(
+            hsi_pred,
+            hsi
+        ).item()
+        
+        running_ssim += ssim_loss(
+            hsi_pred,
+            hsi
+        ).item()
 
         optimizer.zero_grad()
 
@@ -192,61 +216,108 @@ for epoch in range(NUM_EPOCHS):
         / len(train_loader)
     )
 
+    n_train = len(train_loader)
+
+    train_loss = running_loss / n_train
+    train_mrae = running_mrae / n_train
+    train_sam = running_sam / n_train
+    train_psnr = running_psnr / n_train
+    train_ssim = running_ssim / n_train
+
     # --------------------------------------
     # VALIDATION
     # --------------------------------------
-
+    
     residual_net.eval()
-
+    
     val_loss = 0.0
-
+    
+    val_mrae = 0.0
+    val_sam = 0.0
+    val_psnr = 0.0
+    val_ssim = 0.0
+    
     with torch.no_grad():
-
+    
         for rgb, hsi in val_loader:
-
+    
             rgb = rgb.to(DEVICE)
             hsi = hsi.to(DEVICE)
-
+    
             z_rgb = rgb_encoder(rgb)
-
-            z_hsi , _ = hsi_encoder(hsi)
-
+    
+            z_hsi, _ = hsi_encoder(hsi)
+    
             delta_pred = residual_net(
                 z_rgb
             )
-
+    
             z_final = (
                 z_rgb
                 + delta_pred
             )
-
+    
             hsi_pred = hsi_decoder(
                 z_final
             )
-
+    
             loss_latent = F.l1_loss(
                 z_final,
                 z_hsi
             )
-
+    
             loss_recon = F.l1_loss(
                 hsi_pred,
                 hsi
             )
-
+    
             loss = (
                 loss_latent
                 + loss_recon
             )
-
+    
             val_loss += loss.item()
-
-    val_loss /= len(val_loader)
+    
+            val_mrae += mrae_loss(
+                hsi_pred,
+                hsi
+            ).item()
+    
+            val_sam += sam_loss(
+                hsi_pred,
+                hsi
+            ).item()
+    
+            val_psnr += psnr_loss(
+                hsi_pred,
+                hsi
+            ).item()
+    
+            val_ssim += ssim_loss(
+                hsi_pred,
+                hsi
+            ).item()
+    
+    n = len(val_loader)
+    
+    val_loss /= n
+    val_mrae /= n
+    val_sam /= n
+    val_psnr /= n
+    val_ssim /= n
 
     print(
-        f"Epoch {epoch+1}/{NUM_EPOCHS} "
-        f"| Train {train_loss:.6f} "
-        f"| Val {val_loss:.6f}"
+    f"Epoch {epoch+1}/{NUM_EPOCHS} "
+    f"| Train Loss {train_loss:.6f} "
+    f"| Train MRAE {train_mrae:.6f} "
+    f"| Train SAM {train_sam:.6f} "
+    f"| Train PSNR {train_psnr:.4f} "
+    f"| Train SSIM {train_ssim:.6f} "
+    f"| Val Loss {val_loss:.6f} "
+    f"| Val MRAE {val_mrae:.6f} "
+    f"| Val SAM {val_sam:.6f} "
+    f"| Val PSNR {val_psnr:.4f} "
+    f"| Val SSIM {val_ssim:.6f}"
     )
 
     if val_loss < best_loss:
