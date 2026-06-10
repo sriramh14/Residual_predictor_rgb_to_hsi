@@ -204,7 +204,7 @@ for epoch in range(NUM_EPOCHS):
 
             z_rgb = rgb_encoder(rgb)
 
-            z_hsi = hsi_encoder(hsi)
+            z_hsi , _ = hsi_encoder(hsi)
 
             delta_pred = residual_net(
                 z_rgb
