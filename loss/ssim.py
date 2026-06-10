@@ -1,15 +1,15 @@
-import torchmetrics
+# Eval/SSIM.py
+
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-def ssim:
-    ssim_metric = (
-        StructuralSimilarityIndexMeasure(
-            data_range=1.0
-        ).cuda()
-    )
 
-    ssim_value = ssim_metric(
+
+def ssim(
+    pred,
+    target
+):
+    return StructuralSimilarityIndexMeasure(
+        data_range=1.0
+    ).to(pred.device)(
         pred,
-        gt
+        target
     )
-    return ssim
-
