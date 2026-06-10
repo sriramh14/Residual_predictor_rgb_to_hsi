@@ -3,6 +3,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from models.HSIencoder import HSIEncoder
+from models.HSIDecoder import HSIDecoder
+from models.RGBEncoder import RGBEncoder
+
 from dataset.dataset_loader import ARADDataset
 from models.Residual_predictor import ResidualPredictor
 
