@@ -7,6 +7,11 @@ from models.HSIencoder import HSIEncoder
 from models.HSIDecoder import HSIDecoder
 from models.RGBEncoder import RGBEncoder
 
+from loss.mrae import mrae_loss
+from loss.sam import sam_loss
+from loss.psnr import psnr_loss
+from loss.ssim import ssim_loss
+
 from dataset.dataset_loader import ARADDataset
 from models.Residual_predictor import ResidualPredictor
 
