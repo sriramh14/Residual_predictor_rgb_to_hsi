@@ -183,22 +183,22 @@ for epoch in range(NUM_EPOCHS):
             loss_latent
             + loss_recon
         )
-        running_mrae += mrae_loss(
+        running_mrae += mrae(
             hsi_pred,
             hsi
         ).item()
 
-        running_sam += sam_loss(
+        running_sam += sam(
             hsi_pred,
             hsi
         ).item()
         
-        running_psnr += psnr_loss(
+        running_psnr += psnr(
             hsi_pred,
             hsi
         ).item()
         
-        running_ssim += ssim_loss(
+        running_ssim += ssim(
             hsi_pred,
             hsi
         ).item()
@@ -278,22 +278,22 @@ for epoch in range(NUM_EPOCHS):
     
             val_loss += loss.item()
     
-            val_mrae += mrae_loss(
+            val_mrae += mrae(
                 hsi_pred,
                 hsi
             ).item()
     
-            val_sam += sam_loss(
+            val_sam += sam(
                 hsi_pred,
                 hsi
             ).item()
     
-            val_psnr += psnr_loss(
+            val_psnr += psnr(
                 hsi_pred,
                 hsi
             ).item()
     
-            val_ssim += ssim_loss(
+            val_ssim += ssim(
                 hsi_pred,
                 hsi
             ).item()
