@@ -229,9 +229,9 @@ class ARADDataset(Dataset):
         ].astype(
             np.float32
         )
-
-        if hsi.max() > 1:
-            hsi /= hsi.max()
+`       #Removing normalisation
+        #if hsi.max() > 1:
+            #hsi /= hsi.max()
 
         hsi = np.transpose(
             hsi,
