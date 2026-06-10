@@ -16,7 +16,7 @@ BATCH_SIZE = 8
 NUM_EPOCHS = 100
 LR = 1e-4
 
-LATENT_DIM = 8
+LATENT_CHANNELS = 8
 
 CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -46,26 +46,51 @@ val_loader = DataLoader(
     shuffle=False,
     num_workers=4
 )
+# --------------------------------------------------
+# Instantiate models 
+# --------------------------------------------------
+
+hsi_encoder = HSIEncoder(
+    in_channels=31,
+    latent_channels=LATENT_CHANNELS
+).to(DEVICE)
+
+hsi_decoder = HSIDecoder(
+    latent_channels=LATENT_CHANNELS,
+    out_channels=31
+).to(DEVICE)
+
+rgb_encoder = RGBEncoder(
+    in_channels = 3,
+    latent_channels=LATENT_CHANNELS
+).to(DEVICE)
+
 
 # --------------------------------------------------
 # LOAD PRETRAINED MODELS
 # --------------------------------------------------
-
-rgb_encoder = ...
-hsi_encoder = ...
-hsi_decoder = ...
-
-rgb_encoder.load_state_dict(
-    torch.load("rgb_encoder_best.pth")
+rgb_ckpt = torch.load(
+    "checkpoints/rgb_to_hsi_best.pth",
+    map_location=DEVICE
 )
 
+rgb_encoder.load_state_dict(
+    rgb_ckpt["rgb_encoder"]
+)
+
+#Loading HSI VAE
+vae_ckpt = torch.load(
+    "checkpoints/best_model.pth"
+)
 hsi_encoder.load_state_dict(
-    torch.load("hsi_encoder_best.pth")
+    vae_ckpt["encoder"]
 )
 
 hsi_decoder.load_state_dict(
-    torch.load("hsi_decoder_best.pth")
+    vae_ckpt["decoder"]
 )
+
+print("Loaded pretrained RGB encoder and HSI VAE")
 
 rgb_encoder.to(DEVICE)
 hsi_encoder.to(DEVICE)
@@ -89,7 +114,7 @@ for p in hsi_decoder.parameters():
 # --------------------------------------------------
 
 residual_net = ResidualPredictor(
-    latent_dim=LATENT_DIM
+    latent_dim=LATENT_CHANNELS
 ).to(DEVICE)
 
 optimizer = torch.optim.Adam(
