@@ -33,7 +33,7 @@ NUM_WORKERS = 4
 LATENT_CHANNELS = 8
 HIDDEN_DIM = 64
 TIME_DIM = 128
-DIFFUSION_TIMESTEPS = 100
+DIFFUSION_TIMESTEPS = 20
 
 RGB_CHECKPOINT = "checkpoints/rgb_to_hsi_best.pth"
 VAE_CHECKPOINT = "checkpoints/best_model.pth"
