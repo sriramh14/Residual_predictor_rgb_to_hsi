@@ -152,10 +152,13 @@ class DiffusionScheduler:
 
         noise = torch.randn_like(x)
 
-        alpha_bar = self.alpha_bars[t].to(x.device)
+        # Move the schedule to the data device before indexing.
+        # This avoids indexing a CPU tensor with CUDA timestep indices.
+        t = t.to(device=x.device, dtype=torch.long)
+        alpha_bar = self.alpha_bars.to(x.device)[t]
 
         alpha_bar = alpha_bar.view(
-            -1,1,1,1
+            -1, 1, 1, 1
         )
 
         noisy = (
