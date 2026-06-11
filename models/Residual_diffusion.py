@@ -1,19 +1,24 @@
 import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
+
+        if dim < 2:
+            raise ValueError("Time embedding dimension must be at least 2.")
+
         self.dim = dim
 
-    def forward(self, t):
-        half_dim = self.dim // 2
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t = t.float()
 
-        if half_dim < 1:
-            raise ValueError("Time embedding dimension must be at least 2.")
+        half_dim = self.dim // 2
 
         if half_dim == 1:
             frequencies = torch.ones(
@@ -22,85 +27,97 @@ class SinusoidalTimeEmbedding(nn.Module):
                 dtype=t.dtype
             )
         else:
-            scale = math.log(10000) / (half_dim - 1)
+            exponent = math.log(10000.0) / (half_dim - 1)
+
             frequencies = torch.exp(
                 torch.arange(
                     half_dim,
                     device=t.device,
                     dtype=t.dtype
-                ) * -scale
+                ) * -exponent
             )
 
-        emb = t[:, None] * frequencies[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        embedding = t[:, None] * frequencies[None, :]
 
-        # Support an odd requested embedding dimension.
-        if emb.shape[-1] < self.dim:
-            emb = F.pad(emb, (0, self.dim - emb.shape[-1]))
+        embedding = torch.cat(
+            [embedding.sin(), embedding.cos()],
+            dim=-1
+        )
 
-        return emb
+        if embedding.shape[-1] < self.dim:
+            embedding = F.pad(
+                embedding,
+                (0, self.dim - embedding.shape[-1])
+            )
+
+        return embedding
 
 
 class ResidualDiffusionModel(nn.Module):
     def __init__(
         self,
-        latent_dim=8,
-        hidden_dim=64,
-        time_dim=128
+        latent_dim: int = 8,
+        hidden_dim: int = 64,
+        time_dim: int = 128
     ):
         super().__init__()
 
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(time_dim),
             nn.Linear(time_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
         self.conv1 = nn.Conv2d(
             latent_dim * 2,
             hidden_dim,
-            3,
+            kernel_size=3,
             padding=1
         )
 
         self.conv2 = nn.Conv2d(
             hidden_dim,
             hidden_dim,
-            3,
+            kernel_size=3,
             padding=1
         )
 
         self.conv3 = nn.Conv2d(
             hidden_dim,
             hidden_dim,
-            3,
+            kernel_size=3,
             padding=1
         )
 
         self.conv4 = nn.Conv2d(
             hidden_dim,
             hidden_dim,
-            3,
+            kernel_size=3,
             padding=1
         )
 
         self.out = nn.Conv2d(
             hidden_dim,
             latent_dim,
-            3,
+            kernel_size=3,
             padding=1
         )
 
-        self.act = nn.ReLU(inplace=True)
+        self.norm1 = nn.GroupNorm(8, hidden_dim)
+        self.norm2 = nn.GroupNorm(8, hidden_dim)
+        self.norm3 = nn.GroupNorm(8, hidden_dim)
+        self.norm4 = nn.GroupNorm(8, hidden_dim)
+
+        self.act = nn.SiLU()
 
     def forward(
         self,
-        noisy_residual,
-        t,
-        z_rgb
-    ):
-        t_emb = self.time_mlp(t)
+        noisy_residual: torch.Tensor,
+        t: torch.Tensor,
+        z_rgb: torch.Tensor
+    ) -> torch.Tensor:
+        t_embedding = self.time_mlp(t)
 
         x = torch.cat(
             [noisy_residual, z_rgb],
@@ -108,62 +125,62 @@ class ResidualDiffusionModel(nn.Module):
         )
 
         x = self.conv1(x)
-        x = x + t_emb[:, :, None, None]
+        x = self.norm1(x)
+        x = x + t_embedding[:, :, None, None]
         x = self.act(x)
 
-        x = self.act(self.conv2(x))
-        x = self.act(self.conv3(x))
-        x = self.act(self.conv4(x))
+        x = self.act(self.norm2(self.conv2(x)))
+        x = self.act(self.norm3(self.conv3(x)))
+        x = self.act(self.norm4(self.conv4(x)))
 
         return self.out(x)
 
 
 class DiffusionScheduler:
     """
-    Forward diffusion scheduler.
+    Forward diffusion scheduler compatible with DDIM inference.
 
-    Training remains standard epsilon-prediction training. DDIM changes only
-    the reverse inference procedure, so the same trained model can be sampled
-    with DDIM without retraining.
+    Important:
+    The same schedule and number of training timesteps must be used during
+    training and inference.
     """
 
     def __init__(
         self,
-        timesteps=100,
-        schedule="cosine",
-        beta_start=1e-4,
-        beta_end=2e-2,
-        cosine_s=0.008,
-        max_beta=0.999
+        timesteps: int = 20,
+        schedule: str = "cosine",
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
+        cosine_s: float = 0.008,
+        max_beta: float = 0.999
     ):
         if timesteps < 2:
             raise ValueError("timesteps must be at least 2.")
 
         if schedule not in {"linear", "cosine"}:
             raise ValueError(
-                "schedule must be either 'linear' or 'cosine', "
-                f"but received {schedule!r}."
+                "schedule must be 'linear' or 'cosine'."
             )
 
         self.timesteps = timesteps
         self.schedule = schedule
 
         if schedule == "linear":
-            self.betas = torch.linspace(
+            betas = torch.linspace(
                 beta_start,
                 beta_end,
                 timesteps,
                 dtype=torch.float32
             )
         else:
-            self.betas = self._cosine_beta_schedule(
+            betas = self._cosine_beta_schedule(
                 timesteps=timesteps,
                 s=cosine_s,
                 max_beta=max_beta
             )
 
-        self.alphas = 1.0 - self.betas
-
+        self.betas = betas
+        self.alphas = 1.0 - betas
         self.alpha_bars = torch.cumprod(
             self.alphas,
             dim=0
@@ -171,19 +188,10 @@ class DiffusionScheduler:
 
     @staticmethod
     def _cosine_beta_schedule(
-        timesteps,
-        s=0.008,
-        max_beta=0.999
-    ):
-        """
-        Cosine noise schedule from Nichol and Dhariwal.
-
-        alpha_bar(t) = cos^2(
-            ((t / T + s) / (1 + s)) * pi / 2
-        )
-
-        The resulting betas are clipped for numerical stability.
-        """
+        timesteps: int,
+        s: float = 0.008,
+        max_beta: float = 0.999
+    ) -> torch.Tensor:
         steps = timesteps + 1
 
         x = torch.linspace(
@@ -216,151 +224,185 @@ class DiffusionScheduler:
 
     def sample_timesteps(
         self,
-        batch_size,
-        device
-    ):
+        batch_size: int,
+        device: torch.device
+    ) -> torch.Tensor:
         return torch.randint(
-            0,
-            self.timesteps,
-            (batch_size,),
+            low=0,
+            high=self.timesteps,
+            size=(batch_size,),
             device=device,
             dtype=torch.long
         )
 
     def add_noise(
         self,
-        x,
-        t
+        clean_residual: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None
     ):
-        noise = torch.randn_like(x)
+        if noise is None:
+            noise = torch.randn_like(clean_residual)
 
         t = t.to(
-            device=x.device,
+            device=clean_residual.device,
             dtype=torch.long
         )
 
-        alpha_bars = self.alpha_bars.to(x.device)
-        alpha_bar = alpha_bars[t].view(-1, 1, 1, 1)
-
-        noisy = (
-            torch.sqrt(alpha_bar) * x
-            + torch.sqrt(1.0 - alpha_bar) * noise
+        alpha_bars = self.alpha_bars.to(
+            device=clean_residual.device,
+            dtype=clean_residual.dtype
         )
 
-        return noisy, noise
+        alpha_bar_t = alpha_bars[t].view(
+            -1, 1, 1, 1
+        )
 
-    def get_ddim_timesteps(
+        noisy_residual = (
+            torch.sqrt(alpha_bar_t) * clean_residual
+            + torch.sqrt(
+                torch.clamp(
+                    1.0 - alpha_bar_t,
+                    min=0.0
+                )
+            ) * noise
+        )
+
+        return noisy_residual, noise
+
+    def ddim_timesteps(
         self,
-        num_inference_steps,
-        device
-    ):
-        """
-        Return descending DDIM timesteps, for example:
-        [99, 94, 89, ..., 4, 0] for a reduced-step schedule.
-        """
+        num_inference_steps: Optional[int],
+        device: torch.device
+    ) -> torch.Tensor:
+        if num_inference_steps is None:
+            num_inference_steps = self.timesteps
+
         if not 1 <= num_inference_steps <= self.timesteps:
             raise ValueError(
-                "num_inference_steps must be between 1 and "
-                f"{self.timesteps}, but received {num_inference_steps}."
+                "num_inference_steps must be in the interval "
+                f"[1, {self.timesteps}]."
             )
 
-        timesteps = torch.linspace(
-            self.timesteps - 1,
+        if num_inference_steps == self.timesteps:
+            return torch.arange(
+                self.timesteps - 1,
+                -1,
+                -1,
+                device=device,
+                dtype=torch.long
+            )
+
+        # Uniformly select training timesteps and traverse them in reverse.
+        ascending = torch.linspace(
             0,
+            self.timesteps - 1,
             num_inference_steps,
             device=device
         ).round().long()
 
-        # Rounding may theoretically create duplicates. Preserve descending
-        # order while removing duplicate entries.
-        ordered_unique = []
-        seen = set()
+        ascending = torch.unique_consecutive(ascending)
 
-        for step in timesteps.tolist():
-            if step not in seen:
-                ordered_unique.append(step)
-                seen.add(step)
-
-        return ordered_unique
+        return torch.flip(
+            ascending,
+            dims=[0]
+        )
 
 
 def diffusion_loss(
-    model,
-    scheduler,
-    z_rgb,
-    z_hsi
-):
-    """
-    Standard epsilon-prediction loss.
-
-    DDIM uses the same training process as DDPM. Only sampling differs.
-    """
+    model: nn.Module,
+    scheduler: DiffusionScheduler,
+    z_rgb: torch.Tensor,
+    z_hsi: torch.Tensor
+) -> torch.Tensor:
     residual_gt = z_hsi - z_rgb
 
     t = scheduler.sample_timesteps(
-        z_rgb.size(0),
-        z_rgb.device
+        batch_size=z_rgb.size(0),
+        device=z_rgb.device
     )
 
     noisy_residual, noise = scheduler.add_noise(
-        residual_gt,
-        t
+        clean_residual=residual_gt,
+        t=t
     )
 
-    pred_noise = model(
+    predicted_noise = model(
         noisy_residual,
         t.float(),
         z_rgb
     )
 
     return F.mse_loss(
-        pred_noise,
+        predicted_noise,
         noise
     )
 
 
+def _dynamic_threshold(
+    x: torch.Tensor,
+    percentile: float = 0.995,
+    minimum_scale: float = 1.0
+) -> torch.Tensor:
+    """
+    Prevent extreme x0 estimates from exploding during DDIM sampling.
+
+    The operation is applied independently to each sample.
+    """
+    batch_size = x.shape[0]
+
+    flattened = x.abs().reshape(batch_size, -1)
+
+    scale = torch.quantile(
+        flattened,
+        percentile,
+        dim=1
+    )
+
+    scale = torch.maximum(
+        scale,
+        torch.full_like(scale, minimum_scale)
+    )
+
+    scale = scale.view(
+        batch_size,
+        1,
+        1,
+        1
+    )
+
+    return torch.clamp(
+        x,
+        -scale,
+        scale
+    ) / scale
+
+
 @torch.no_grad()
 def sample_residual_ddim(
-    model,
-    scheduler,
-    z_rgb,
-    num_inference_steps=50,
-    eta=0.0,
-    initial_noise=None,
-    clip_denoised=False,
-    clip_range=1.0
-):
+    model: nn.Module,
+    scheduler: DiffusionScheduler,
+    z_rgb: torch.Tensor,
+    num_inference_steps: Optional[int] = None,
+    eta: float = 0.0,
+    initial_noise: Optional[torch.Tensor] = None,
+    use_dynamic_threshold: bool = True,
+    dynamic_threshold_percentile: float = 0.995
+) -> torch.Tensor:
     """
-    Generate the latent residual using the complete DDIM reverse process.
+    Perform the complete DDIM reverse process.
 
-    Parameters
-    ----------
-    model:
-        Trained residual noise-prediction model.
-    scheduler:
-        DiffusionScheduler used during training.
-    z_rgb:
-        RGB latent condition, shaped [B, C, H, W].
-    num_inference_steps:
-        Number of DDIM reverse steps. This can be lower than the number of
-        training timesteps. A common starting value is 50.
-    eta:
-        DDIM stochasticity parameter.
-        eta=0.0 gives deterministic DDIM after the initial noise is fixed.
-        eta>0.0 adds stochasticity.
-    initial_noise:
-        Optional starting Gaussian noise. Supplying the same tensor makes
-        repeated runs exactly reproducible.
-    clip_denoised:
-        Whether to clamp the estimated clean residual x_0. Keep False unless
-        normalized residuals are known to lie in a bounded interval.
-    clip_range:
-        Clamp interval used when clip_denoised=True.
+    Defaults
+    --------
+    num_inference_steps=None:
+        Uses all 20 training timesteps by default.
+    eta=0:
+        Deterministic DDIM reverse transitions after the initial noise.
+    use_dynamic_threshold=True:
+        Prevents extremely large clean-residual estimates that can cause the
+        decoder output, PSNR, and SSIM to become invalid.
 
-    Returns
-    -------
-    residual:
-        Predicted clean latent residual r_0, shaped like z_rgb.
+    The model must have been trained using the same scheduler configuration.
     """
     if eta < 0.0:
         raise ValueError("eta must be non-negative.")
@@ -368,126 +410,155 @@ def sample_residual_ddim(
     model.eval()
 
     device = z_rgb.device
+    dtype = z_rgb.dtype
     batch_size = z_rgb.size(0)
 
     alpha_bars = scheduler.alpha_bars.to(
         device=device,
-        dtype=z_rgb.dtype
+        dtype=dtype
     )
 
-    ddim_timesteps = scheduler.get_ddim_timesteps(
-        num_inference_steps,
-        device
+    inference_timesteps = scheduler.ddim_timesteps(
+        num_inference_steps=num_inference_steps,
+        device=device
     )
 
     if initial_noise is None:
-        residual = torch.randn_like(z_rgb)
+        x_t = torch.randn_like(z_rgb)
     else:
         if initial_noise.shape != z_rgb.shape:
             raise ValueError(
-                "initial_noise must have the same shape as z_rgb. "
-                f"Got {initial_noise.shape} and {z_rgb.shape}."
+                "initial_noise and z_rgb must have identical shapes."
             )
-        residual = initial_noise.to(
+
+        x_t = initial_noise.to(
             device=device,
-            dtype=z_rgb.dtype
+            dtype=dtype
         )
 
-    for index, step in enumerate(ddim_timesteps):
-        t = torch.full(
+    for index, timestep in enumerate(inference_timesteps):
+        step = int(timestep.item())
+
+        t_batch = torch.full(
             (batch_size,),
             step,
             device=device,
             dtype=torch.long
         )
 
-        pred_noise = model(
-            residual,
-            t.float(),
+        predicted_noise = model(
+            x_t,
+            t_batch.float(),
             z_rgb
         )
 
         alpha_bar_t = alpha_bars[step]
 
-        if index + 1 < len(ddim_timesteps):
-            previous_step = ddim_timesteps[index + 1]
-            alpha_bar_prev = alpha_bars[previous_step]
+        if index + 1 < len(inference_timesteps):
+            previous_step = int(
+                inference_timesteps[index + 1].item()
+            )
+            alpha_bar_previous = alpha_bars[previous_step]
         else:
-            # At the final reverse step, alpha_bar_prev = 1 gives x_prev = x_0.
-            alpha_bar_prev = torch.ones(
+            alpha_bar_previous = torch.ones(
                 (),
                 device=device,
-                dtype=z_rgb.dtype
+                dtype=dtype
             )
 
         sqrt_alpha_bar_t = torch.sqrt(
-            torch.clamp(alpha_bar_t, min=1e-12)
-        )
-        sqrt_one_minus_alpha_bar_t = torch.sqrt(
-            torch.clamp(1.0 - alpha_bar_t, min=0.0)
-        )
-
-        # Estimate the clean residual x_0 from x_t and predicted epsilon.
-        pred_clean_residual = (
-            residual
-            - sqrt_one_minus_alpha_bar_t * pred_noise
-        ) / sqrt_alpha_bar_t
-
-        if clip_denoised:
-            pred_clean_residual = pred_clean_residual.clamp(
-                -clip_range,
-                clip_range
-            )
-
-        # DDIM variance:
-        # sigma_t = eta * sqrt(
-        #   ((1-a_prev)/(1-a_t)) * (1-a_t/a_prev)
-        # )
-        variance_term = (
-            (1.0 - alpha_bar_prev)
-            / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
-        ) * (
-            1.0
-            - alpha_bar_t
-            / torch.clamp(alpha_bar_prev, min=1e-12)
-        )
-
-        sigma_t = eta * torch.sqrt(
-            torch.clamp(variance_term, min=0.0)
-        )
-
-        # Direction pointing from x_0 toward x_t.
-        direction_coefficient = torch.sqrt(
             torch.clamp(
-                1.0 - alpha_bar_prev - sigma_t.square(),
+                alpha_bar_t,
+                min=1e-8
+            )
+        )
+
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(
+            torch.clamp(
+                1.0 - alpha_bar_t,
                 min=0.0
             )
         )
 
-        residual = (
-            torch.sqrt(alpha_bar_prev) * pred_clean_residual
-            + direction_coefficient * pred_noise
+        predicted_clean_residual = (
+            x_t
+            - sqrt_one_minus_alpha_bar_t * predicted_noise
+        ) / sqrt_alpha_bar_t
+
+        if use_dynamic_threshold:
+            predicted_clean_residual = _dynamic_threshold(
+                predicted_clean_residual,
+                percentile=dynamic_threshold_percentile
+            )
+
+        variance_ratio = (
+            (1.0 - alpha_bar_previous)
+            / torch.clamp(
+                1.0 - alpha_bar_t,
+                min=1e-8
+            )
         )
 
-        if eta > 0.0 and index + 1 < len(ddim_timesteps):
-            residual = residual + sigma_t * torch.randn_like(residual)
+        transition_ratio = (
+            1.0
+            - alpha_bar_t
+            / torch.clamp(
+                alpha_bar_previous,
+                min=1e-8
+            )
+        )
 
-    return residual
+        sigma_t = eta * torch.sqrt(
+            torch.clamp(
+                variance_ratio * transition_ratio,
+                min=0.0
+            )
+        )
+
+        direction_scale = torch.sqrt(
+            torch.clamp(
+                1.0
+                - alpha_bar_previous
+                - sigma_t.square(),
+                min=0.0
+            )
+        )
+
+        x_previous = (
+            torch.sqrt(alpha_bar_previous)
+            * predicted_clean_residual
+            + direction_scale
+            * predicted_noise
+        )
+
+        if (
+            eta > 0.0
+            and index + 1 < len(inference_timesteps)
+        ):
+            x_previous = (
+                x_previous
+                + sigma_t * torch.randn_like(x_t)
+            )
+
+        x_t = x_previous
+
+    return x_t
 
 
-# Backward-compatible name. Existing inference.py code that imports and calls
-# sample_residual(...) will now use DDIM automatically.
 @torch.no_grad()
 def sample_residual(
-    model,
-    scheduler,
-    z_rgb,
-    num_inference_steps=50,
-    eta=0.0,
-    initial_noise=None,
-    clip_denoised=False,
-    clip_range=1.0
-):
+    model: nn.Module,
+    scheduler: DiffusionScheduler,
+    z_rgb: torch.Tensor,
+    num_inference_steps: Optional[int] = None,
+    eta: float = 0.0,
+    initial_noise: Optional[torch.Tensor] = None,
+    use_dynamic_threshold: bool = True,
+    dynamic_threshold_percentile: float = 0.995
+) -> torch.Tensor:
+    """
+    Backward-compatible alias used by the existing inference.py.
+    """
     return sample_residual_ddim(
         model=model,
         scheduler=scheduler,
@@ -495,6 +566,6 @@ def sample_residual(
         num_inference_steps=num_inference_steps,
         eta=eta,
         initial_noise=initial_noise,
-        clip_denoised=clip_denoised,
-        clip_range=clip_range
+        use_dynamic_threshold=use_dynamic_threshold,
+        dynamic_threshold_percentile=dynamic_threshold_percentile
     )
