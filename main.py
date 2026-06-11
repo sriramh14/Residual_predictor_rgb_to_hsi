@@ -6,6 +6,13 @@ from torch.utils.data import DataLoader
 from models.HSIencoder import HSIEncoder
 from models.HSIDecoder import HSIDecoder
 from models.RGBEncoder import RGBEncoder
+from models.ResidualDiffusion import ( 
+    ResidualDiffusionModel, 
+    DiffusionScheduler, 
+    diffusion_loss, 
+    sample_residual 
+)
+
 
 from loss.mrae import mrae
 from loss.sam import sam
