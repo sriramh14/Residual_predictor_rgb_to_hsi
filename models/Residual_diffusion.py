@@ -130,20 +130,37 @@ class DiffusionScheduler:
     def __init__(
         self,
         timesteps=100,
+        schedule="cosine",
         beta_start=1e-4,
-        beta_end=2e-2
+        beta_end=2e-2,
+        cosine_s=0.008,
+        max_beta=0.999
     ):
         if timesteps < 2:
             raise ValueError("timesteps must be at least 2.")
 
-        self.timesteps = timesteps
+        if schedule not in {"linear", "cosine"}:
+            raise ValueError(
+                "schedule must be either 'linear' or 'cosine', "
+                f"but received {schedule!r}."
+            )
 
-        self.betas = torch.linspace(
-            beta_start,
-            beta_end,
-            timesteps,
-            dtype=torch.float32
-        )
+        self.timesteps = timesteps
+        self.schedule = schedule
+
+        if schedule == "linear":
+            self.betas = torch.linspace(
+                beta_start,
+                beta_end,
+                timesteps,
+                dtype=torch.float32
+            )
+        else:
+            self.betas = self._cosine_beta_schedule(
+                timesteps=timesteps,
+                s=cosine_s,
+                max_beta=max_beta
+            )
 
         self.alphas = 1.0 - self.betas
 
@@ -151,6 +168,51 @@ class DiffusionScheduler:
             self.alphas,
             dim=0
         )
+
+    @staticmethod
+    def _cosine_beta_schedule(
+        timesteps,
+        s=0.008,
+        max_beta=0.999
+    ):
+        """
+        Cosine noise schedule from Nichol and Dhariwal.
+
+        alpha_bar(t) = cos^2(
+            ((t / T + s) / (1 + s)) * pi / 2
+        )
+
+        The resulting betas are clipped for numerical stability.
+        """
+        steps = timesteps + 1
+
+        x = torch.linspace(
+            0,
+            timesteps,
+            steps,
+            dtype=torch.float64
+        )
+
+        alpha_bars = torch.cos(
+            (
+                (x / timesteps + s)
+                / (1.0 + s)
+            )
+            * math.pi
+            * 0.5
+        ).pow(2)
+
+        alpha_bars = alpha_bars / alpha_bars[0]
+
+        betas = 1.0 - (
+            alpha_bars[1:]
+            / alpha_bars[:-1]
+        )
+
+        return betas.clamp(
+            min=1e-8,
+            max=max_beta
+        ).float()
 
     def sample_timesteps(
         self,
