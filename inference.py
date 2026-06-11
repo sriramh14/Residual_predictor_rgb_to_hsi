@@ -19,7 +19,7 @@ from loss.sam import sam
 from loss.psnr import psnr
 from loss.ssim import ssim
 
-from dataset.dataset_loader import ARADDataset
+from dataset.random_arad_loader import load_random_arad1k_samples
 
 # --------------------------------------------------
 # CONFIG
@@ -33,7 +33,7 @@ NUM_WORKERS = 4
 LATENT_CHANNELS = 8
 HIDDEN_DIM = 64
 TIME_DIM = 128
-DIFFUSION_TIMESTEPS = 20
+DIFFUSION_TIMESTEPS = 100
 
 RGB_CHECKPOINT = "checkpoints/rgb_to_hsi_best.pth"
 VAE_CHECKPOINT = "checkpoints/best_model.pth"
@@ -47,6 +47,10 @@ SAVE_PREDICTIONS = True
 
 # Fixing the seed makes stochastic reverse diffusion reproducible.
 SEED = 42
+NUM_RANDOM_IMAGES = 50
+ARAD_TOTAL_IMAGES = 1000
+DATA_ROOT = "data"
+
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
@@ -55,9 +59,14 @@ if torch.cuda.is_available():
 # LOAD VALIDATION / TEST DATA
 # --------------------------------------------------
 
-# ARADDataset currently uses train=False for the held-out 30 samples.
-test_dataset = ARADDataset(
-    train=False
+# Select 50 unique random RGB-HSI pairs from the ARAD1K pool.
+# Keeping SEED fixed makes the selected image set reproducible.
+test_dataset, selected_samples = load_random_arad1k_samples(
+    root_dir=DATA_ROOT,
+    num_samples=NUM_RANDOM_IMAGES,
+    seed=SEED,
+    total_images=ARAD_TOTAL_IMAGES,
+    download=True
 )
 
 test_loader = DataLoader(
@@ -159,6 +168,26 @@ running_ssim = 0.0
 rows = []
 sample_index = 0
 
+selected_samples_path = os.path.join(
+    OUTPUT_DIR,
+    "selected_samples.csv"
+)
+
+with open(selected_samples_path, "w", newline="") as selected_file:
+
+    selected_writer = csv.DictWriter(
+        selected_file,
+        fieldnames=[
+            "subset_index",
+            "dataset_index",
+            "rgb_filename",
+            "hsi_filename"
+        ]
+    )
+
+    selected_writer.writeheader()
+    selected_writer.writerows(selected_samples)
+
 with torch.inference_mode():
 
     for rgb, hsi in test_loader:
@@ -200,6 +229,11 @@ with torch.inference_mode():
 
             sample_index += 1
 
+            sample_info = selected_samples[sample_index - 1]
+            sample_stem = os.path.splitext(
+                sample_info["hsi_filename"]
+            )[0]
+
             pred_cube = hsi_pred[b].detach().cpu().numpy()
             gt_cube = hsi[b].detach().cpu().numpy()
 
@@ -211,7 +245,7 @@ with torch.inference_mode():
 
                 output_path = os.path.join(
                     OUTPUT_DIR,
-                    f"prediction_{sample_index:04d}.mat"
+                    f"prediction_{sample_index:04d}_{sample_stem}.mat"
                 )
 
                 sio.savemat(
@@ -225,6 +259,9 @@ with torch.inference_mode():
             rows.append(
                 {
                     "sample": sample_index,
+                    "dataset_index": sample_info["dataset_index"],
+                    "rgb_filename": sample_info["rgb_filename"],
+                    "hsi_filename": sample_info["hsi_filename"],
                     "batch_mrae": batch_mrae,
                     "batch_sam": batch_sam,
                     "batch_psnr": batch_psnr,
@@ -260,6 +297,9 @@ with open(metrics_path, "w", newline="") as csv_file:
 
     fieldnames = [
         "sample",
+        "dataset_index",
+        "rgb_filename",
+        "hsi_filename",
         "batch_mrae",
         "batch_sam",
         "batch_psnr",
@@ -291,4 +331,5 @@ print(f"MRAE: {mean_mrae:.6f}")
 print(f"SAM: {mean_sam:.6f}")
 print(f"PSNR: {mean_psnr:.4f}")
 print(f"SSIM: {mean_ssim:.6f}")
+print(f"Selected sample list: {selected_samples_path}")
 print(f"Results saved in: {OUTPUT_DIR}")
