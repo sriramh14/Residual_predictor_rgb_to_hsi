@@ -32,7 +32,7 @@ LR = 1e-4
 LATENT_CHANNELS = 8
 HIDDEN_DIM = 64
 TIME_DIM = 128
-DIFFUSION_TIMESTEPS = 20
+DIFFUSION_TIMESTEPS = 100
 
 CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -213,7 +213,13 @@ for epoch in range(NUM_EPOCHS):
         # training batch while retaining the original metric reporting.
         with torch.no_grad():
 
-            alpha_bar = noise_scheduler.alpha_bars[t].to(DEVICE)
+            # `t` is used as an index, so it must be a LongTensor on
+            # the same device as the diffusion schedule being indexed.
+            t = t.to(device=DEVICE, dtype=torch.long)
+
+            # Move alpha_bars to DEVICE before indexing. Indexing first
+            # would fail when alpha_bars is on CPU and `t` is on CUDA.
+            alpha_bar = noise_scheduler.alpha_bars.to(DEVICE)[t]
             alpha_bar = alpha_bar.view(-1, 1, 1, 1)
 
             delta_pred = (
