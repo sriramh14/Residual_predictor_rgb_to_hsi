@@ -69,6 +69,14 @@ test_dataset, selected_samples = load_random_arad1k_samples(
     download=True
 )
 
+if len(test_dataset) != NUM_RANDOM_IMAGES:
+    raise RuntimeError(
+        f"Expected {NUM_RANDOM_IMAGES} inference images, "
+        f"but the loader returned {len(test_dataset)}."
+    )
+
+print(f"Inference dataset size: {len(test_dataset)}")
+
 test_loader = DataLoader(
     test_dataset,
     batch_size=BATCH_SIZE,
@@ -191,6 +199,14 @@ with open(selected_samples_path, "w", newline="") as selected_file:
 with torch.inference_mode():
 
     for rgb, hsi in test_loader:
+
+        # Safety guard: never process more than NUM_RANDOM_IMAGES.
+        remaining = NUM_RANDOM_IMAGES - sample_index
+        if remaining <= 0:
+            break
+        if rgb.size(0) > remaining:
+            rgb = rgb[:remaining]
+            hsi = hsi[:remaining]
 
         rgb = rgb.to(DEVICE)
         hsi = hsi.to(DEVICE)
