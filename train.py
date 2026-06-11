@@ -422,9 +422,7 @@ def main():
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=NUM_WORKERS,
         pin_memory=DEVICE.type == "cuda",
-        persistent_workers=NUM_WORKERS > 0,
         drop_last=False
     )
 
@@ -432,9 +430,7 @@ def main():
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=NUM_WORKERS,
         pin_memory=DEVICE.type == "cuda",
-        persistent_workers=NUM_WORKERS > 0,
         drop_last=False
     )
 
