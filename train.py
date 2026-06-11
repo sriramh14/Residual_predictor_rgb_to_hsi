@@ -1,11 +1,12 @@
 """
-Train the deterministic MST++ model with the DiT-style bottleneck.
+Train MST++ with the deterministic DiT-style bottleneck.
 
-Expected dataset output:
+Dataset output:
     rgb: [B, 3, H, W]
     hsi: [B, 31, H, W]
 
-Both tensors should be float tensors scaled consistently, preferably to [0, 1].
+Both should use the same normalization, preferably [0, 1].
+The script automatically uses both GPUs through nn.DataParallel when available.
 """
 
 import os
@@ -15,10 +16,11 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# Adjust these two imports to match your repository.
-from models.Hybrid_mstplusplus import MST_Plus_Plus
+# Adjust these imports to match your repository.
+from models.mst_plus_plus_dit import MST_Plus_Plus
 from dataset.dataset_loader import ARADDataset
 
 
@@ -27,21 +29,27 @@ from dataset.dataset_loader import ARADDataset
 # ---------------------------------------------------------------------
 
 SEED = 42
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+NUM_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 EPOCHS = 100
-BATCH_SIZE = 4
+
+# Global batch size becomes:
+# BATCH_SIZE_PER_GPU × number of visible GPUs.
+BATCH_SIZE_PER_GPU = 4
+BATCH_SIZE = BATCH_SIZE_PER_GPU * max(NUM_GPUS, 1)
+
 LEARNING_RATE = 4e-4
 MIN_LEARNING_RATE = 1e-6
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 1.0
 
-NUM_WORKERS = 4
+NUM_WORKERS = 8 if NUM_GPUS > 1 else 4
 USE_AMP = DEVICE.type == "cuda"
 USE_PAIRED_AUGMENTATION = True
 
 # "mixed": 0.5*L1 + 0.4*MRAE + 0.1*SAM
-# "mrae":  MRAE only, closer to the original MST++ training objective
+# "mrae": MRAE only
 LOSS_MODE = "mixed"
 
 CHECKPOINT_DIR = "checkpoints_mstpp_dit"
@@ -78,11 +86,7 @@ def mrae(pred, target, eps=1e-3):
 
 
 def sam(pred, target, eps=1e-8):
-    """
-    Mean spectral angle in radians.
-
-    pred, target: [B, C, H, W]
-    """
+    """Mean spectral angle in radians for [B, C, H, W]."""
     dot = torch.sum(pred * target, dim=1)
     pred_norm = torch.linalg.vector_norm(pred, dim=1)
     target_norm = torch.linalg.vector_norm(target, dim=1)
@@ -91,7 +95,6 @@ def sam(pred, target, eps=1e-8):
         pred_norm * target_norm,
         min=eps
     )
-
     cosine = torch.clamp(
         cosine,
         min=-1.0 + 1e-7,
@@ -102,33 +105,30 @@ def sam(pred, target, eps=1e-8):
 
 
 def psnr(pred, target, data_range=1.0, eps=1e-10):
-    """
-    Mean per-image PSNR.
-    """
+    """Mean per-image PSNR."""
     mse_per_image = torch.mean(
         (pred - target).square(),
         dim=(1, 2, 3)
     )
 
-    values = 10.0 * torch.log10(
-        (data_range ** 2)
-        / torch.clamp(mse_per_image, min=eps)
-    )
-
-    return values.mean()
+    return (
+        10.0
+        * torch.log10(
+            (data_range ** 2)
+            / torch.clamp(mse_per_image, min=eps)
+        )
+    ).mean()
 
 
 def reconstruction_loss(pred, target):
+    """
+    Training/validation objective computed on raw model outputs.
+    Reported reconstruction metrics are calculated separately after clamping.
+    """
     loss_mrae = mrae(pred, target)
 
     if LOSS_MODE == "mrae":
-        total = loss_mrae
-        components = {
-            "l1": torch.zeros_like(total),
-            "mrae": loss_mrae,
-            "sam": torch.zeros_like(total),
-        }
-        return total, components
+        return loss_mrae
 
     if LOSS_MODE != "mixed":
         raise ValueError(
@@ -138,19 +138,32 @@ def reconstruction_loss(pred, target):
     loss_l1 = F.l1_loss(pred, target)
     loss_sam = sam(pred, target)
 
-    total = (
+    return (
         0.5 * loss_l1
         + 0.4 * loss_mrae
         + 0.1 * loss_sam
     )
 
-    components = {
-        "l1": loss_l1,
-        "mrae": loss_mrae,
-        "sam": loss_sam,
-    }
 
-    return total, components
+def evaluation_metrics(pred, target):
+    """
+    Train and validation metrics use exactly the same preprocessing.
+
+    This assumes the HSI data are normalized to [0, 1].
+    Clamping is used only for reporting metrics, not for the training loss.
+    """
+    pred_eval = pred.float().clamp(0.0, 1.0)
+    target_eval = target.float().clamp(0.0, 1.0)
+
+    return {
+        "mrae": mrae(pred_eval, target_eval),
+        "sam": sam(pred_eval, target_eval),
+        "psnr": psnr(
+            pred_eval,
+            target_eval,
+            data_range=1.0
+        ),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -158,12 +171,6 @@ def reconstruction_loss(pred, target):
 # ---------------------------------------------------------------------
 
 def unpack_batch(batch):
-    """
-    Supports either:
-        (rgb, hsi)
-    or:
-        {"rgb": rgb, "hsi": hsi}
-    """
     if isinstance(batch, (tuple, list)) and len(batch) >= 2:
         return batch[0], batch[1]
 
@@ -171,15 +178,13 @@ def unpack_batch(batch):
         return batch["rgb"], batch["hsi"]
 
     raise TypeError(
-        "Each dataset batch must be (rgb, hsi) or "
+        "Each batch must be (rgb, hsi) or "
         "{'rgb': rgb, 'hsi': hsi}."
     )
 
 
 def paired_augmentation(rgb, hsi):
-    """
-    Applies the same random spatial transform to RGB and HSI.
-    """
+    """Apply identical random transforms to RGB and HSI."""
     if torch.rand(1).item() < 0.5:
         rgb = torch.flip(rgb, dims=[-1])
         hsi = torch.flip(hsi, dims=[-1])
@@ -198,150 +203,12 @@ def paired_augmentation(rgb, hsi):
 
 
 # ---------------------------------------------------------------------
-# TRAIN AND VALIDATION
+# MULTI-GPU AND CHECKPOINT HELPERS
 # ---------------------------------------------------------------------
 
-def train_one_epoch(
-    model,
-    loader,
-    optimizer,
-    scaler
-):
-    model.train()
-
-    totals = {
-        "loss": 0.0,
-        "l1": 0.0,
-        "mrae": 0.0,
-        "sam": 0.0,
-    }
-    sample_count = 0
-
-    for batch in loader:
-        rgb, hsi = unpack_batch(batch)
-
-        rgb = rgb.to(
-            DEVICE,
-            dtype=torch.float32,
-            non_blocking=True
-        )
-        hsi = hsi.to(
-            DEVICE,
-            dtype=torch.float32,
-            non_blocking=True
-        )
-
-        if USE_PAIRED_AUGMENTATION:
-            rgb, hsi = paired_augmentation(rgb, hsi)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        autocast_context = (
-            torch.amp.autocast(
-                device_type="cuda",
-                dtype=torch.float16
-            )
-            if USE_AMP
-            else nullcontext()
-        )
-
-        with autocast_context:
-            pred = model(rgb)
-            loss, components = reconstruction_loss(pred, hsi)
-
-        scaler.scale(loss).backward()
-
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=GRAD_CLIP_NORM
-        )
-
-        scaler.step(optimizer)
-        scaler.update()
-
-        batch_size = rgb.size(0)
-        sample_count += batch_size
-
-        totals["loss"] += loss.detach().item() * batch_size
-        totals["l1"] += components["l1"].detach().item() * batch_size
-        totals["mrae"] += components["mrae"].detach().item() * batch_size
-        totals["sam"] += components["sam"].detach().item() * batch_size
-
-    return {
-        key: value / sample_count
-        for key, value in totals.items()
-    }
-
-
-@torch.inference_mode()
-def validate(
-    model,
-    loader
-):
-    model.eval()
-
-    totals = {
-        "loss": 0.0,
-        "l1": 0.0,
-        "mrae": 0.0,
-        "sam": 0.0,
-        "psnr": 0.0,
-    }
-    sample_count = 0
-
-    for batch in loader:
-        rgb, hsi = unpack_batch(batch)
-
-        rgb = rgb.to(
-            DEVICE,
-            dtype=torch.float32,
-            non_blocking=True
-        )
-        hsi = hsi.to(
-            DEVICE,
-            dtype=torch.float32,
-            non_blocking=True
-        )
-
-        autocast_context = (
-            torch.amp.autocast(
-                device_type="cuda",
-                dtype=torch.float16
-            )
-            if USE_AMP
-            else nullcontext()
-        )
-
-        with autocast_context:
-            pred = model(rgb)
-            loss, components = reconstruction_loss(pred, hsi)
-
-        # Metrics assume HSI data are normalized to [0, 1].
-        pred_eval = pred.float().clamp(0.0, 1.0)
-        hsi_eval = hsi.float().clamp(0.0, 1.0)
-
-        batch_mrae = mrae(pred_eval, hsi_eval)
-        batch_sam = sam(pred_eval, hsi_eval)
-        batch_psnr = psnr(
-            pred_eval,
-            hsi_eval,
-            data_range=1.0
-        )
-
-        batch_size = rgb.size(0)
-        sample_count += batch_size
-
-        totals["loss"] += loss.item() * batch_size
-        totals["l1"] += components["l1"].item() * batch_size
-        totals["mrae"] += batch_mrae.item() * batch_size
-        totals["sam"] += batch_sam.item() * batch_size
-        totals["psnr"] += batch_psnr.item() * batch_size
-
-    return {
-        key: value / sample_count
-        for key, value in totals.items()
-    }
+def unwrap_model(model):
+    """Return the underlying model when nn.DataParallel is active."""
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
 
 
 def save_checkpoint(
@@ -356,20 +223,114 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "model": model.state_dict(),
+            # Save without the DataParallel "module." prefix.
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "best_mrae": best_mrae,
             "config": {
                 "epochs": EPOCHS,
-                "batch_size": BATCH_SIZE,
+                "batch_size_per_gpu": BATCH_SIZE_PER_GPU,
+                "global_batch_size": BATCH_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "loss_mode": LOSS_MODE,
+                "num_gpus": NUM_GPUS,
             },
         },
         path
     )
+
+
+# ---------------------------------------------------------------------
+# TRAINING AND VALIDATION
+# ---------------------------------------------------------------------
+
+def run_epoch(
+    model,
+    loader,
+    optimizer=None,
+    scaler=None
+):
+    is_training = optimizer is not None
+
+    if is_training:
+        model.train()
+    else:
+        model.eval()
+
+    totals = {
+        "loss": 0.0,
+        "mrae": 0.0,
+        "sam": 0.0,
+        "psnr": 0.0,
+    }
+    sample_count = 0
+
+    grad_context = nullcontext() if is_training else torch.inference_mode()
+
+    with grad_context:
+        for batch in loader:
+            rgb, hsi = unpack_batch(batch)
+
+            rgb = rgb.to(
+                DEVICE,
+                dtype=torch.float32,
+                non_blocking=True
+            )
+            hsi = hsi.to(
+                DEVICE,
+                dtype=torch.float32,
+                non_blocking=True
+            )
+
+            if is_training and USE_PAIRED_AUGMENTATION:
+                rgb, hsi = paired_augmentation(rgb, hsi)
+
+            if is_training:
+                optimizer.zero_grad(set_to_none=True)
+
+            autocast_context = (
+                torch.amp.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16
+                )
+                if USE_AMP
+                else nullcontext()
+            )
+
+            with autocast_context:
+                pred = model(rgb)
+                loss = reconstruction_loss(pred, hsi)
+
+            if is_training:
+                scaler.scale(loss).backward()
+
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=GRAD_CLIP_NORM
+                )
+
+                scaler.step(optimizer)
+                scaler.update()
+
+            # Use identical clamped metric evaluation for train and validation.
+            with torch.no_grad():
+                metrics = evaluation_metrics(pred, hsi)
+
+            batch_size = rgb.size(0)
+            sample_count += batch_size
+
+            totals["loss"] += loss.detach().item() * batch_size
+            totals["mrae"] += metrics["mrae"].item() * batch_size
+            totals["sam"] += metrics["sam"].item() * batch_size
+            totals["psnr"] += metrics["psnr"].item() * batch_size
+
+    return {
+        key: value / sample_count
+        for key, value in totals.items()
+    }
 
 
 # ---------------------------------------------------------------------
@@ -400,7 +361,7 @@ def main():
         drop_last=False
     )
 
-    model = MST_Plus_Plus(
+    base_model = MST_Plus_Plus(
         in_channels=3,
         out_channels=31,
         n_feat=31,
@@ -409,10 +370,23 @@ def main():
 
     parameter_count = sum(
         parameter.numel()
-        for parameter in model.parameters()
+        for parameter in base_model.parameters()
     )
 
-    print(f"Device: {DEVICE}")
+    # Automatically use both visible GPUs.
+    if NUM_GPUS > 1:
+        model = torch.nn.DataParallel(
+            base_model,
+            device_ids=list(range(NUM_GPUS))
+        )
+    else:
+        model = base_model
+
+    print(f"Primary device: {DEVICE}")
+    print(f"Visible GPUs: {NUM_GPUS}")
+    print(f"Multi-GPU enabled: {NUM_GPUS > 1}")
+    print(f"Batch size per GPU: {BATCH_SIZE_PER_GPU}")
+    print(f"Global batch size: {BATCH_SIZE}")
     print(f"Parameters: {parameter_count:,}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
@@ -438,20 +412,19 @@ def main():
     best_mrae = float("inf")
 
     for epoch in range(1, EPOCHS + 1):
-        train_metrics = train_one_epoch(
+        train_metrics = run_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             scaler=scaler
         )
 
-        val_metrics = validate(
+        val_metrics = run_epoch(
             model=model,
             loader=val_loader
         )
 
         scheduler.step()
-
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(
@@ -460,6 +433,7 @@ def main():
             f"Train Loss {train_metrics['loss']:.6f} | "
             f"Train MRAE {train_metrics['mrae']:.6f} | "
             f"Train SAM {train_metrics['sam']:.6f} | "
+            f"Train PSNR {train_metrics['psnr']:.4f} | "
             f"Val Loss {val_metrics['loss']:.6f} | "
             f"Val MRAE {val_metrics['mrae']:.6f} | "
             f"Val SAM {val_metrics['sam']:.6f} | "
