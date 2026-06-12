@@ -25,6 +25,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset.dataset_loader import ARADDataset
+from loss.mrae import mrae
+from loss.sam import sam
+from loss.psnr import psnr
 from models.Bottleneck_diffusion_mst import (
     DiffusionScheduler,
     MSTPlusPlusBottleneckDiffusion,
@@ -94,31 +97,8 @@ set_seed(SEED)
 
 
 # ---------------------------------------------------------------------
-# METRICS / AUXILIARY RECONSTRUCTION LOSS
+# REPOSITORY METRICS / AUXILIARY RECONSTRUCTION LOSS
 # ---------------------------------------------------------------------
-
-
-def mrae(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3):
-    pred = pred.float()
-    target = target.float()
-    return ((pred - target).abs() / target.abs().clamp_min(eps)).mean()
-
-
-def sam(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8):
-    pred = pred.float()
-    target = target.float()
-    dot = (pred * target).sum(dim=1)
-    denominator = (
-        torch.linalg.vector_norm(pred, dim=1)
-        * torch.linalg.vector_norm(target, dim=1)
-    ).clamp_min(eps)
-    cosine = (dot / denominator).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-    return torch.acos(cosine).mean()
-
-
-def psnr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-10):
-    mse = (pred.float() - target.float()).square().mean(dim=(1, 2, 3))
-    return (10.0 * torch.log10(1.0 / mse.clamp_min(eps))).mean()
 
 
 def spectral_reconstruction_loss(pred: torch.Tensor, target: torch.Tensor):
